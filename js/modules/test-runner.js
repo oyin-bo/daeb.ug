@@ -328,9 +328,17 @@ export async function run(options = {}) {
       }
     };
     
-    // Run tests with daebugRunTests
+    // Run tests in isolated iframe context (browser only)
     const startTime = Date.now();
-    const results = await daebugRunTests({ files: testFiles, ...options });
+    let results;
+    
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      // Browser context - run in iframe
+      results = await runTestsInIframe(testFiles, options, streamProgress);
+    } else {
+      // Worker context - run directly
+      results = await daebugRunTests({ files: testFiles, ...options });
+    }
     
     // Stream final results - include ALL tests, not just recent
     await streamProgress({
@@ -358,6 +366,103 @@ export async function run(options = {}) {
     console.error('[test-runner] run() failed:', err);
     throw err;
   }
+}
+
+/**
+ * Run tests in an isolated iframe
+ * @param {string[]} testFiles
+ * @param {any} options
+ * @param {function} streamProgress
+ * @returns {Promise<any>}
+ */
+async function runTestsInIframe(testFiles, options, streamProgress) {
+  return new Promise((resolve, reject) => {
+    // Create iframe
+    const iframe = document.createElement('iframe');
+    iframe.src = 'about:blank';
+    iframe.style.position = 'fixed';
+    iframe.style.left = '5px';
+    iframe.style.top = '5px';
+    iframe.style.width = '10%';
+    iframe.style.height = '10%';
+    iframe.style.pointerEvents = 'none';
+    iframe.style.opacity = '0.00001';
+    iframe.style.border = 'none';
+    
+    iframe.onload = async () => {
+      try {
+        const iframeWindow = /** @type {any} */ (iframe.contentWindow);
+        const iframeDoc = /** @type {any} */ (iframe.contentDocument);
+        
+        if (!iframeWindow || !iframeDoc) {
+          throw new Error('Failed to access iframe window or document');
+        }
+        
+        // Create a script tag to import and run the test runner in iframe context
+        const script = iframeDoc.createElement('script');
+        script.type = 'module';
+        script.textContent = `
+          import { daebugRunTests } from '/daebug/test-runner.js';
+          
+          // Run tests and post results back to parent
+          (async () => {
+            try {
+              const results = await daebugRunTests(${JSON.stringify({ files: testFiles, ...options })});
+              window.parent.postMessage({ type: 'test-results', results }, '*');
+            } catch (err) {
+              window.parent.postMessage({ 
+                type: 'test-error', 
+                error: err.message,
+                stack: err.stack 
+              }, '*');
+            }
+          })();
+        `;
+        
+        // Listen for results from iframe
+        const messageHandler = (/** @type {any} */ event) => {
+          if (event.source !== iframeWindow) return;
+          
+          if (event.data.type === 'test-results') {
+            window.removeEventListener('message', messageHandler);
+            // Clean up
+            if (iframe.parentNode) {
+              document.body.removeChild(iframe);
+            }
+            resolve(event.data.results);
+          } else if (event.data.type === 'test-error') {
+            window.removeEventListener('message', messageHandler);
+            // Clean up
+            if (iframe.parentNode) {
+              document.body.removeChild(iframe);
+            }
+            reject(new Error(event.data.error));
+          }
+        };
+        
+        window.addEventListener('message', messageHandler);
+        
+        // Inject the script
+        iframeDoc.head.appendChild(script);
+        
+      } catch (err) {
+        // Clean up on error
+        if (iframe.parentNode) {
+          document.body.removeChild(iframe);
+        }
+        reject(err);
+      }
+    };
+    
+    iframe.onerror = (err) => {
+      if (iframe.parentNode) {
+        document.body.removeChild(iframe);
+      }
+      reject(new Error('Failed to load iframe: ' + err));
+    };
+    
+    document.body.appendChild(iframe);
+  });
 }
 
 /**
